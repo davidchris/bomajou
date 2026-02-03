@@ -1,33 +1,36 @@
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use clap::Parser;
-use dotenv::dotenv;
-use reqwest::Error as ReqwestError;
-use serde_json::Value;
-use std::collections::BTreeMap;
+use dotenvy::dotenv;
+use serde::Deserialize;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
-use std::fs::File;
-use std::io;
-use std::io::{BufWriter, Write};
+use std::fs::{self, File};
+use std::io::{self, BufWriter, Write};
+use std::path::Path;
+use std::time::{Duration, Instant};
+use thiserror::Error;
 
 const SORT: &str = "-created";
 const PER_PAGE: &str = "20";
 
-#[derive(Debug)]
-enum CustomError {
-    ReqwestError(reqwest::Error),
-    IoError(io::Error),
+#[derive(Debug, Error)]
+enum AppError {
+    #[error("HTTP request failed: {0}")]
+    Request(#[from] reqwest::Error),
+    #[error("IO error: {0}")]
+    Io(#[from] io::Error),
 }
 
-impl From<ReqwestError> for CustomError {
-    fn from(err: ReqwestError) -> Self {
-        CustomError::ReqwestError(err)
-    }
+#[derive(Debug, Deserialize)]
+struct RaindropResponse {
+    items: Vec<Bookmark>,
 }
 
-impl From<io::Error> for CustomError {
-    fn from(err: io::Error) -> Self {
-        CustomError::IoError(err)
-    }
+#[derive(Debug, Deserialize)]
+struct Bookmark {
+    link: String,
+    title: String,
+    created: DateTime<Utc>,
 }
 
 #[derive(Parser, Debug)]
@@ -40,8 +43,68 @@ struct Args {
     perpage: String,
 }
 
+fn parse_existing_file(path: &Path) -> (BTreeMap<String, Vec<String>>, HashSet<String>) {
+    let mut bookmarks_by_date: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut existing_urls: HashSet<String> = HashSet::new();
+
+    if !path.exists() {
+        return (bookmarks_by_date, existing_urls);
+    }
+
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return (bookmarks_by_date, existing_urls),
+    };
+
+    let mut current_date: Option<String> = None;
+
+    for line in content.lines() {
+        // Parse day headings: #### [[YYYY-MM-DD]] (new format) or ## [[YYYY-MM-DD]] (old format)
+        if line.ends_with("]]") {
+            let is_day_heading =
+                line.starts_with("#### [[") || (line.starts_with("## [[") && line.len() == 17); // ## [[YYYY-MM-DD]] is 17 chars
+
+            if is_day_heading {
+                let date = line
+                    .trim_start_matches("#### [[")
+                    .trim_start_matches("## [[")
+                    .trim_end_matches("]]");
+                if date.len() == 10 && date.chars().nth(4) == Some('-') {
+                    current_date = Some(date.to_string());
+                    continue;
+                }
+            }
+
+            // Skip year and month headings (new format)
+            if line.starts_with("## [[") || line.starts_with("### [[") {
+                continue;
+            }
+        }
+
+        // Parse bookmark lines: - [title](url)
+        if line.starts_with("- [") {
+            if let Some(start) = line.find("](") {
+                if let Some(end) = line.rfind(')') {
+                    let url = &line[start + 2..end];
+                    existing_urls.insert(url.to_string());
+
+                    if let Some(ref date) = current_date {
+                        let bookmark_text = line.trim_start_matches("- ").to_string();
+                        bookmarks_by_date
+                            .entry(date.clone())
+                            .or_default()
+                            .push(bookmark_text);
+                    }
+                }
+            }
+        }
+    }
+
+    (bookmarks_by_date, existing_urls)
+}
+
 #[tokio::main]
-async fn main() -> Result<(), CustomError> {
+async fn main() -> Result<(), AppError> {
     dotenv().ok();
     let args = Args::parse();
 
@@ -49,63 +112,130 @@ async fn main() -> Result<(), CustomError> {
     let url_base = env::var("URL_BASE").expect("URL_BASE must be set");
     let md_file_destination =
         env::var("MD_FILE_DESTINATION").expect("MD_FILE_DESTINATION must be set");
-    let url = format!("{}?sort={}&perpage={}", url_base, args.sort, args.perpage,);
+
+    let md_path = Path::new(&md_file_destination);
+    let (mut bookmarks_by_date, existing_urls) = parse_existing_file(md_path);
+    let existing_count = existing_urls.len();
+
+    println!("Found {} existing bookmark(s) in file", existing_count);
 
     let client = reqwest::Client::new();
-    let request = client.get(url).bearer_auth(access_token).build()?;
+    let perpage: usize = args.perpage.parse().unwrap_or(20);
+    let mut page = 0;
+    let mut new_bookmarks_count = 0;
+    let mut total_fetched = 0;
+    let start_time = Instant::now();
 
-    let response = client.execute(request).await?;
+    loop {
+        let url = format!(
+            "{}?sort={}&perpage={}&page={}",
+            url_base, args.sort, perpage, page
+        );
 
-    if response.status().is_success() {
-        let json: Value = response.json().await?;
-        if let Some(bookmark_items) = json.get("items") {
-            if let Some(bookmark_array) = bookmark_items.as_array() {
-                let mut bookmarks_by_date: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let request = client.get(&url).bearer_auth(&access_token).build()?;
 
-                for bookmark in bookmark_array.iter() {
-                    if let Some(title) = bookmark.get("title") {
-                        if let Some(created_str) = bookmark.get("created").and_then(Value::as_str) {
-                            let created_dt: DateTime<Utc> = Utc
-                                .datetime_from_str(created_str, "%Y-%m-%dT%H:%M:%S%.fZ")
-                                .unwrap_or_else(|_| {
-                                    println!("Unable to parse timestamp: {}", created_str);
-                                    Utc::now()
-                                });
+        let response = client.execute(request).await?;
 
-                            let created_date = created_dt.format("%Y-%m-%d").to_string();
-
-                            let link = bookmark.get("link").and_then(Value::as_str).unwrap();
-
-                            bookmarks_by_date
-                                .entry(created_date)
-                                .or_insert_with(Vec::new)
-                                .push(format!("[{}]({})", title, link));
-                        } else {
-                            println!("'created' field not found in JSON object");
-                        }
-                    }
-                }
-                // println!("Bookmarks by date hashmap: {}", bookmark_items);
-                let file = File::create(md_file_destination)?;
-                let mut buf_writer = BufWriter::new(file);
-
-                writeln!(buf_writer, "# Bomajou")?;
-
-                for (date, titles) in bookmarks_by_date.iter() {
-                    writeln!(buf_writer, "\n## [[{}]]\n", date)?;
-
-                    for title in titles.iter() {
-                        writeln!(buf_writer, "- {}", title)?;
-                    }
-                }
-            } else {
-                println!("The 'items' field is not an array.");
-            }
-        } else {
-            println!("'items' field not found in JSON object.");
+        if !response.status().is_success() {
+            println!("Request failed with status: {}", response.status());
+            break;
         }
+
+        let response_data: RaindropResponse = response.json().await?;
+
+        if response_data.items.is_empty() {
+            break;
+        }
+
+        let page_count = response_data.items.len();
+        total_fetched += page_count;
+        print!(
+            "\rFetching... page {}, {} bookmarks so far",
+            page + 1,
+            total_fetched
+        );
+        io::stdout().flush().ok();
+
+        for bookmark in &response_data.items {
+            if existing_urls.contains(&bookmark.link) {
+                continue;
+            }
+
+            let created_date = bookmark.created.format("%Y-%m-%d").to_string();
+
+            bookmarks_by_date
+                .entry(created_date)
+                .or_default()
+                .push(format!("[{}]({})", bookmark.title, bookmark.link));
+
+            new_bookmarks_count += 1;
+        }
+
+        if response_data.items.len() < perpage {
+            break;
+        }
+
+        page += 1;
+
+        // Rate limit: ~2 requests/sec to stay well under 120/min limit
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    let elapsed = start_time.elapsed();
+    let throughput = if elapsed.as_secs_f64() > 0.0 {
+        total_fetched as f64 / elapsed.as_secs_f64()
     } else {
-        println!("Request failed with status: {}", response.status());
+        0.0
+    };
+
+    println!();
+    println!(
+        "Fetched {} bookmarks in {:.2}s ({:.1} bookmarks/sec)",
+        total_fetched,
+        elapsed.as_secs_f64(),
+        throughput
+    );
+    println!(
+        "New: {}, Skipped (existing): {}, Total in file: {}",
+        new_bookmarks_count,
+        total_fetched - new_bookmarks_count,
+        existing_count + new_bookmarks_count
+    );
+
+    if bookmarks_by_date.is_empty() {
+        println!("No bookmarks to write, keeping existing file unchanged.");
+        return Ok(());
+    }
+
+    let file = File::create(md_file_destination)?;
+    let mut buf_writer = BufWriter::new(file);
+
+    writeln!(buf_writer, "# Bomajou")?;
+
+    let mut current_year: Option<&str> = None;
+    let mut current_month: Option<&str> = None;
+
+    for (date, bookmarks) in bookmarks_by_date.iter() {
+        // date format: YYYY-MM-DD
+        let year = &date[0..4];
+        let month = &date[0..7];
+
+        if current_year != Some(year) {
+            writeln!(buf_writer, "\n## [[{}]]", year)?;
+            current_year = Some(year);
+            current_month = None;
+        }
+
+        if current_month != Some(month) {
+            writeln!(buf_writer, "\n### [[{}]]", month)?;
+            current_month = Some(month);
+        }
+
+        writeln!(buf_writer, "\n#### [[{}]]\n", date)?;
+
+        for bookmark in bookmarks.iter() {
+            writeln!(buf_writer, "- {}", bookmark)?;
+        }
     }
 
     Ok(())

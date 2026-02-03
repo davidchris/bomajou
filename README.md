@@ -27,7 +27,6 @@ https://developer.raindrop.io/
 
 `cargo run`
 
-
 ## Output structure
 
 ```markdown
@@ -36,5 +35,4 @@ https://developer.raindrop.io/
 ## [[YYYY-MM-DD]]
 
 - [Bookmark title](<link to bookmark>)
-
 ```
